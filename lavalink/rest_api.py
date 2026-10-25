@@ -1,7 +1,7 @@
 import re
 from collections import namedtuple
 from typing import Dict, Tuple, Union
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import aiohttp
 import discord
@@ -111,6 +111,42 @@ def reformat_query(query):
 
 
 _V4_LOAD_TYPES = {"track", "playlist", "search", "empty", "error"}
+
+_YOUTUBE_PLAYLIST_PARAMS = {"list", "index", "start_radio", "pp"}
+
+
+def strip_youtube_playlist_params(query: str) -> str:
+    """Remove playlist parameters from a YouTube video URL.
+
+    YouTube watch links copied from a playlist carry ``list``/``index`` parameters.
+    Lavalink then tries to load the playlist instead of the video, which fails
+    entirely when that playlist is private or deleted. Dropping those parameters
+    lets the same link play the video on its own.
+
+    Pure playlist URLs and non-YouTube URLs are returned unchanged.
+    """
+    try:
+        parsed = urlparse(query)
+    except ValueError:
+        return query
+
+    if not parsed.netloc:
+        return query
+
+    url_domain = ".".join(parsed.netloc.split(".")[-2:])
+    if url_domain not in ("youtube.com", "youtu.be"):
+        return query
+
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(key == "list" for key, _ in params):
+        return query
+
+    kept = [(key, value) for key, value in params if key not in _YOUTUBE_PLAYLIST_PARAMS]
+    is_short_link = parsed.netloc.endswith("youtu.be")
+    if not is_short_link and not any(key == "v" for key, _ in kept):
+        return query
+
+    return urlunparse(parsed._replace(query=urlencode(kept)))
 
 
 def _adapt_v4_track(track) -> dict:
@@ -383,9 +419,32 @@ class RESTClient:
             raise
         return data
 
+    async def _load_once(self, identifier: str, timestamp_query: str) -> LoadResult:
+        url = self._uri + quote(identifier)
+        data = await self._get(url)
+        if self._is_v4:
+            data = adapt_v4_load_result(data)
+        if isinstance(data, dict):
+            data = dict(data)
+            data["query"] = timestamp_query
+            data["encodedquery"] = url
+            return LoadResult(data)
+        elif isinstance(data, list):
+            modified_data = {
+                "loadType": LoadType.V2_COMPAT,
+                "tracks": data,
+                "query": timestamp_query,
+                "encodedquery": url,
+            }
+            return LoadResult(modified_data)
+        return LoadResult({"loadType": LoadType.LOAD_FAILED, "tracks": [], "playlistInfo": {}})
+
     async def load_tracks(self, query) -> LoadResult:
         """
         Executes a loadtracks request. Supports Lavalink V3 and V4.
+
+        If a YouTube video link that carries playlist parameters fails to load,
+        it is retried without those parameters so the video still plays.
 
         Parameters
         ----------
@@ -398,23 +457,15 @@ class RESTClient:
         self.__check_node_ready()
         _raw_url = str(query)
         parsed_url = reformat_query(_raw_url)
-        url = self._uri + quote(parsed_url)
-
-        data = await self._get(url)
-        if self._is_v4:
-            data = adapt_v4_load_result(data)
-        if isinstance(data, dict):
-            data["query"] = _raw_url
-            data["encodedquery"] = url
-            return LoadResult(data)
-        elif isinstance(data, list):
-            modified_data = {
-                "loadType": LoadType.V2_COMPAT,
-                "tracks": data,
-                "query": _raw_url,
-                "encodedquery": url,
-            }
-            return LoadResult(modified_data)
+        result = await self._load_once(parsed_url, _raw_url)
+        if result.has_error or not result.tracks:
+            fallback = strip_youtube_playlist_params(parsed_url)
+            if fallback != parsed_url:
+                log.debug("Retrying track load without playlist parameters: %s", fallback)
+                retry = await self._load_once(fallback, fallback)
+                if not retry.has_error and retry.tracks:
+                    return retry
+        return result
 
     async def get_tracks(self, query) -> Tuple[Track, ...]:
         """
