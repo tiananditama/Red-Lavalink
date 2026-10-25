@@ -33,6 +33,14 @@ PositionTime = namedtuple("PositionTime", "position time connected")
 MemoryInfo = namedtuple("MemoryInfo", "reservable used free allocated")
 CPUInfo = namedtuple("CPUInfo", "cores systemLoad lavalinkLoad")
 
+_V4_TRACK_END_REASONS = {
+    "finished": "FINISHED",
+    "loadFailed": "LOAD_FAILED",
+    "stopped": "STOPPED",
+    "replaced": "REPLACED",
+    "cleanup": "CLEANUP",
+}
+
 
 # Originally Added in: https://github.com/PythonistaGuild/Wavelink/pull/66
 class _Key:
@@ -87,7 +95,7 @@ class NodeStats:
         self.system_load = cpu["systemLoad"]
         self.lavalink_load = cpu["lavalinkLoad"]
 
-        frame_stats = data.get("frameStats", {})
+        frame_stats = data.get("frameStats") or {}
         self.frames_sent = frame_stats.get("sent", -1)
         self.frames_nulled = frame_stats.get("nulled", -1)
         self.frames_deficit = frame_stats.get("deficit", -1)
@@ -162,6 +170,10 @@ class Node:
             self._resume_key = self._gen_key()
         self._resume_timeout = resume_timeout
         self._resuming_configured = False
+        self._major_version: Optional[int] = None
+        self._session_id: Optional[str] = None
+        self._session_id_event = asyncio.Event()
+        self._filters: dict = {}
         self.num_shards = num_shards
         self.user_id = user_id
 
@@ -246,10 +258,13 @@ class Node:
             If the connection attempt must be aborted during a reconnect attempt
         """
         self._is_shutdown = shutdown
+        if self._major_version is None:
+            await self._detect_major_version()
+        path = "/v4/websocket" if self.protocol_version >= 4 else ""
         if self.secured:
-            uri = f"wss://{self.host}:{self.port}"
+            uri = f"wss://{self.host}:{self.port}{path}"
         else:
-            uri = f"ws://{self.host}:{self.port}"
+            uri = f"ws://{self.host}:{self.port}{path}"
 
         ws_ll_log.info("Lavalink WS connecting to %s with headers %s", uri, self.headers)
         if self.try_connect_task is not None:
@@ -263,7 +278,24 @@ class Node:
     async def _configure_resume(self):
         if self._resuming_configured:
             return
-        if self._resume_key and self._resume_timeout and self._resume_timeout > 0:
+        if not (self._resume_key and self._resume_timeout and self._resume_timeout > 0):
+            return
+        if self.protocol_version >= 4:
+            try:
+                await asyncio.wait_for(self._session_id_event.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                ws_ll_log.warning(
+                    "Timed out waiting for a Lavalink session ID; resuming not configured."
+                )
+                return
+            if not self._session_id:
+                return
+            await self._rest_request(
+                "PATCH",
+                f"/v4/sessions/{self._session_id}",
+                json={"resuming": True, "timeout": int(self._resume_timeout)},
+            )
+        else:
             await self.send(
                 dict(
                     op="configureResuming",
@@ -271,8 +303,8 @@ class Node:
                     timeout=self._resume_timeout,
                 )
             )
-            self._resuming_configured = True
-            ws_ll_log.debug("Node Resuming has been configured.")
+        self._resuming_configured = True
+        ws_ll_log.debug("Node Resuming has been configured.")
 
     async def wait_until_ready(self, *, timeout: Optional[float] = None):
         await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
@@ -291,6 +323,31 @@ class Node:
         return headers
 
     @property
+    def protocol_version(self) -> int:
+        """The Lavalink protocol major version this node uses (3 or 4)."""
+        return self._major_version or 3
+
+    async def _detect_major_version(self) -> None:
+        protocol = "https" if self.secured else "http"
+        url = f"{protocol}://{self.host}:{self.port}/v4/info"
+        try:
+            async with self.session.get(
+                url,
+                headers={"Authorization": self.password},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    if isinstance(data, dict) and "version" in data:
+                        self._major_version = 4
+                        ws_ll_log.info("Detected Lavalink v4 protocol")
+                        return
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            ws_ll_log.debug("Failed to detect Lavalink protocol version: %s", exc)
+        self._major_version = 3
+        ws_ll_log.info("Detected Lavalink v3 protocol")
+
+    @property
     def lavalink_major_version(self):
         if not self.ready:
             raise NodeNotReady("Node not ready!")
@@ -306,6 +363,9 @@ class Node:
     async def _multi_try_connect(self, uri):
         backoff = ExponentialBackoff()
         attempt = 1
+        self._session_id = None
+        self._session_id_event.clear()
+        self._resuming_configured = False
         if self._listener_task is not None:
             self._listener_task.cancel()
         if self._ws is not None:
@@ -344,7 +404,7 @@ class Node:
         if self._is_shutdown is False:
             self._listener_task = asyncio.create_task(self.listener())
             asyncio.create_task(self._configure_resume())
-            if self._queue:
+            if self.protocol_version < 4 and self._queue:
                 temp = self._queue.copy()
                 self._queue.clear()
                 for data in temp:
@@ -403,8 +463,41 @@ class Node:
             self.update_state(NodeState.RECONNECTING)
             self.reconnect_task = asyncio.create_task(self._reconnect(shutdown=self._is_shutdown))
 
+    def _normalize_v4_event(self, data: dict) -> dict:
+        normalized = dict(data)
+        track = normalized.get("track")
+        if isinstance(track, dict):
+            normalized["track"] = track.get("encoded")
+        reason = normalized.get("reason")
+        if normalized.get("type") == LavalinkEvents.TRACK_END.value and isinstance(reason, str):
+            normalized["reason"] = _V4_TRACK_END_REASONS.get(reason, reason.upper())
+        exception = normalized.get("exception")
+        if isinstance(exception, dict):
+            exc = dict(exception)
+            severity = exc.get("severity")
+            if isinstance(severity, str):
+                exc["severity"] = severity.upper()
+            exc["message"] = exc.get("message") or ""
+            exc["cause"] = exc.get("cause") or ""
+            normalized["exception"] = exc
+        return normalized
+
     async def _handle_op(self, op: LavalinkIncomingOp, data):
+        if op == LavalinkIncomingOp.READY:
+            self._session_id = data.get("sessionId")
+            if self._session_id:
+                self._session_id_event.set()
+            ws_ll_log.debug(
+                "Lavalink session ready: %s (resumed=%s)",
+                self._session_id,
+                data.get("resumed"),
+            )
+            if self.protocol_version >= 4:
+                asyncio.create_task(self._flush_queue())
+            return
         if op == LavalinkIncomingOp.EVENT:
+            if self.protocol_version >= 4:
+                data = self._normalize_v4_event(data)
             try:
                 event = LavalinkEvents(data.get("type"))
             except ValueError:
@@ -434,6 +527,8 @@ class Node:
 
     async def _reconnect(self, *, shutdown: bool = False):
         self._ready_event.clear()
+        self._session_id = None
+        self._session_id_event.clear()
 
         if self._is_shutdown is True or shutdown:
             ws_ll_log.info("[NODE] | Shutting down Lavalink WS.")
@@ -610,8 +705,16 @@ class Node:
 
         self.update_state(NodeState.DISCONNECTING)
 
-        if self._resuming_configured and not (self._ws is None or self._ws.closed):
-            await self.send(dict(op="configureResuming", key=None))
+        if self._resuming_configured:
+            if self.protocol_version >= 4 and self._session_id:
+                await self._rest_request(
+                    "PATCH",
+                    f"/v4/sessions/{self._session_id}",
+                    json={"resuming": False, "timeout": 0},
+                )
+            elif not (self._ws is None or self._ws.closed):
+                await self.send(dict(op="configureResuming", key=None))
+        self._session_id = None
         self._resuming_configured = False
 
         for p in tuple(self.players):
@@ -638,11 +741,115 @@ class Node:
         ws_ll_log.info("Shutdown Lavalink WS.")
 
     async def send(self, data):
+        if self.protocol_version >= 4:
+            await self._send_v4(data)
+            return
         if self._ws is None or self._ws.closed:
             self._queue.append(data)
         else:
             ws_ll_log.trace("Sending data to Lavalink node: %s", data)
             await self._ws.send_json(data)
+
+    def _player_path(self, guild_id) -> str:
+        return f"/v4/sessions/{self._session_id}/players/{guild_id}"
+
+    async def _rest_request(self, method: str, path: str, *, params=None, json=None):
+        protocol = "https" if self.secured else "http"
+        url = f"{protocol}://{self.host}:{self.port}{path}"
+        try:
+            async with self.session.request(
+                method,
+                url,
+                headers={"Authorization": self.password},
+                params=params,
+                json=json,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 204:
+                    return None
+                if resp.status >= 400:
+                    body = await resp.text()
+                    ws_ll_log.error(
+                        "Lavalink REST request failed: %s %s (%s): %s",
+                        method,
+                        path,
+                        resp.status,
+                        body,
+                    )
+                    return None
+                return await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            ws_ll_log.error("Lavalink REST request failed: %s %s: %s", method, path, exc)
+            return None
+
+    async def _send_v4(self, data):
+        op = data.get("op")
+        if op == "configureResuming":
+            if not self._session_id:
+                return
+            resuming = data.get("key") is not None
+            timeout = int(data.get("timeout") or 0) if resuming else 0
+            await self._rest_request(
+                "PATCH",
+                f"/v4/sessions/{self._session_id}",
+                json={"resuming": resuming, "timeout": timeout},
+            )
+            return
+
+        if self._session_id is None:
+            self._queue.append(data)
+            return
+
+        guild_id = data.get("guildId")
+        path = self._player_path(guild_id)
+
+        if op == LavalinkOutgoingOp.PLAY.value:
+            payload = {
+                "track": {"encoded": data.get("track")},
+                "position": int(data.get("startTime") or 0),
+                "paused": bool(data.get("pause", False)),
+            }
+            params = {"noReplace": "true"} if data.get("noReplace") else None
+            await self._rest_request("PATCH", path, params=params, json=payload)
+        elif op == LavalinkOutgoingOp.STOP.value:
+            await self._rest_request("PATCH", path, json={"track": {"encoded": None}})
+        elif op == LavalinkOutgoingOp.PAUSE.value:
+            await self._rest_request("PATCH", path, json={"paused": bool(data.get("pause"))})
+        elif op == LavalinkOutgoingOp.SEEK.value:
+            await self._rest_request(
+                "PATCH", path, json={"position": int(data.get("position") or 0)}
+            )
+        elif op == LavalinkOutgoingOp.VOLUME.value:
+            await self._rest_request("PATCH", path, json={"volume": int(data.get("volume") or 0)})
+        elif op == "equalizer":
+            guild_key = str(guild_id)
+            filters = dict(self._filters.get(guild_key, {}))
+            filters["equalizer"] = data.get("bands") or []
+            self._filters[guild_key] = filters
+            await self._rest_request("PATCH", path, json={"filters": filters})
+        elif op == LavalinkOutgoingOp.DESTROY.value:
+            await self._rest_request("DELETE", path)
+        elif op == LavalinkOutgoingOp.VOICE_UPDATE.value:
+            event = data.get("event") or {}
+            voice = {
+                "token": event.get("token"),
+                "endpoint": event.get("endpoint"),
+                "sessionId": data.get("sessionId"),
+            }
+            if not all(voice.values()):
+                ws_ll_log.warning("Refusing to send incomplete voice update: %s", voice)
+                return
+            await self._rest_request("PATCH", path, json={"voice": voice})
+        else:
+            ws_ll_log.warning("Unsupported Lavalink v4 op: %s", data)
+
+    async def _flush_queue(self):
+        if self.protocol_version < 4 or self._session_id is None:
+            return
+        queue = self._queue
+        self._queue = []
+        for data in queue:
+            await self._send_v4(data)
 
     async def send_lavalink_voice_update(self, guild_id, session_id, channel_id, event):
         await self.send(

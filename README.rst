@@ -13,6 +13,10 @@ Red-Lavalink
 A Lavalink client library written for Python 3.8 using the AsyncIO framework.
 This library may be used for other projects as it contains no Red specific code or logic.
 
+The client supports both Lavalink v3 and v4. The protocol version is detected
+automatically from the node (v4 nodes are identified via the ``/v4/info``
+endpoint), and v4 player commands are issued through the v4 REST API.
+
 However, it is important to note that this library only supports projects using discord.py.
 
 To install::

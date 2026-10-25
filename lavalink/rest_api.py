@@ -110,6 +110,66 @@ def reformat_query(query):
     return query
 
 
+_V4_LOAD_TYPES = {"track", "playlist", "search", "empty", "error"}
+
+
+def _adapt_v4_track(track) -> dict:
+    if isinstance(track, str):
+        return {"track": track, "info": {}}
+    if not isinstance(track, dict):
+        return {"track": None, "info": {}}
+    return {
+        "track": track.get("encoded") or track.get("track"),
+        "info": track.get("info") or {},
+        "extras": track.get("userData") or track.get("extras") or {},
+    }
+
+
+def adapt_v4_load_result(data):
+    """Convert a Lavalink v4 loadtracks response to the v3 shape used by this library."""
+    if not isinstance(data, dict):
+        return data
+    load_type = data.get("loadType")
+    if load_type not in _V4_LOAD_TYPES:
+        return data
+
+    payload = data.get("data")
+    if load_type == "track":
+        tracks = [_adapt_v4_track(payload)] if payload else []
+        return {"loadType": LoadType.TRACK_LOADED, "tracks": tracks, "playlistInfo": {}}
+    if load_type == "playlist":
+        payload = payload or {}
+        info = payload.get("info") or {}
+        return {
+            "loadType": LoadType.PLAYLIST_LOADED,
+            "tracks": [_adapt_v4_track(track) for track in payload.get("tracks") or []],
+            "playlistInfo": {
+                "name": info.get("name"),
+                "selectedTrack": info.get("selectedTrack", -1),
+            },
+        }
+    if load_type == "search":
+        return {
+            "loadType": LoadType.SEARCH_RESULT,
+            "tracks": [_adapt_v4_track(track) for track in payload or []],
+            "playlistInfo": {},
+        }
+    if load_type == "empty":
+        return {"loadType": LoadType.NO_MATCHES, "tracks": [], "playlistInfo": {}}
+
+    payload = payload or {}
+    return {
+        "loadType": LoadType.LOAD_FAILED,
+        "tracks": [],
+        "playlistInfo": {},
+        "exception": {
+            "message": payload.get("message") or "",
+            "cause": payload.get("cause") or "",
+            "severity": str(payload.get("severity") or "fault").upper(),
+        },
+    }
+
+
 class Track:
     """
     Information about a Lavalink track.
@@ -141,7 +201,7 @@ class Track:
     def __init__(self, data):
         self.requester = None
 
-        self.track_identifier = data.get("track")
+        self.track_identifier = data.get("encoded") or data.get("track")
         self._info = data.get("info", {})
         self.seekable = self._info.get("isSeekable", False)
         self.author = self._info.get("author")
@@ -151,12 +211,15 @@ class Track:
         self.title = self._info.get("title")
         self.uri = self._info.get("uri")
         self.start_timestamp = self._info.get("timestamp", 0)
-        self.extras = data.get("extras", {})
+        self.extras = data.get("userData") or data.get("extras", {})
+        self._artwork_url = self._info.get("artworkUrl")
 
     @property
     def thumbnail(self):
-        """Optional[str]: Returns a thumbnail URL for YouTube tracks."""
-        if "youtube" in self.uri and "identifier" in self._info:
+        """Optional[str]: Returns a thumbnail URL for the track, if available."""
+        if self._artwork_url:
+            return self._artwork_url
+        if self.uri and "youtube" in self.uri and "identifier" in self._info:
             return "https://img.youtube.com/vi/{}/mqdefault.jpg".format(self._info["identifier"])
 
     def __eq__(self, other):
@@ -174,7 +237,7 @@ class Track:
 
     def __hash__(self):
         """Overrides the default implementation"""
-        return hash(tuple(sorted([self.track_identifier, self.title, self.author, self.uri])))
+        return hash((self.track_identifier, self.title, self.author, self.uri))
 
     def __repr__(self):
         return (
@@ -290,7 +353,11 @@ class RESTClient:
             protocol = "https"
         else:
             protocol = "http"
-        self._uri: str = f"{protocol}://{self.node.host}:{self.node.port}/loadtracks?identifier="
+        self._is_v4: bool = self.node.protocol_version >= 4
+        loadtracks_path = (
+            "/v4/loadtracks?identifier=" if self._is_v4 else "/loadtracks?identifier="
+        )
+        self._uri: str = f"{protocol}://{self.node.host}:{self.node.port}{loadtracks_path}"
         self._headers: Dict[str, str] = {"Authorization": self.node.password}
         self._warned: bool = False
 
@@ -318,7 +385,7 @@ class RESTClient:
 
     async def load_tracks(self, query) -> LoadResult:
         """
-        Executes a loadtracks request. Only works on Lavalink V3.
+        Executes a loadtracks request. Supports Lavalink V3 and V4.
 
         Parameters
         ----------
@@ -334,6 +401,8 @@ class RESTClient:
         url = self._uri + quote(parsed_url)
 
         data = await self._get(url)
+        if self._is_v4:
+            data = adapt_v4_load_result(data)
         if isinstance(data, dict):
             data["query"] = _raw_url
             data["encodedquery"] = url

@@ -72,6 +72,7 @@ class TrackEndReason(enum.Enum):
 
 
 class LavalinkIncomingOp(enum.Enum):
+    READY = "ready"
     EVENT = "event"
     PLAYER_UPDATE = "playerUpdate"
     STATS = "stats"

@@ -129,8 +129,12 @@ def patch_node(monkeypatch):
     async def send(self, data):
         self._MOCK_send(data)
 
+    async def detect_major_version(self):
+        self._major_version = 3
+
     websockets_patch = patch("aiohttp.ClientSession.ws_connect", new=MagicMock(wraps=connect))
     monkeypatch.setattr(lavalink.node.Node, "send", send)
+    monkeypatch.setattr(lavalink.node.Node, "_detect_major_version", detect_major_version)
     monkeypatch.setattr(lavalink.node.Node, "_MOCK_send", MagicMock(), raising=False)
     websockets_patch.start()
     yield
