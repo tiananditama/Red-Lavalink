@@ -835,6 +835,7 @@ class Node:
                 "token": event.get("token"),
                 "endpoint": event.get("endpoint"),
                 "sessionId": data.get("sessionId"),
+                "channelId": str(data.get("channelId")) if data.get("channelId") else None,
             }
             if not all(voice.values()):
                 ws_ll_log.warning("Refusing to send incomplete voice update: %s", voice)

@@ -238,6 +238,7 @@ async def test_send_v4_voice_update():
             "op": "voiceUpdate",
             "guildId": "1",
             "sessionId": "discord-voice-session",
+            "channelId": "channel-id",
             "event": {"token": "token", "endpoint": "endpoint"},
         }
     )
@@ -252,6 +253,7 @@ async def test_send_v4_voice_update():
                     "token": "token",
                     "endpoint": "endpoint",
                     "sessionId": "discord-voice-session",
+                    "channelId": "channel-id",
                 }
             },
         )
