@@ -50,6 +50,7 @@ class Player(RESTClient, VoiceProtocol):
         self.current: Optional[Track] = None
         self._paused: bool = False
         self.repeat: bool = False
+        self.repeat_track: bool = False
         self.shuffle: bool = False
         self.shuffle_bumped: bool = True
         self._is_autoplaying: bool = False
@@ -303,6 +304,8 @@ class Player(RESTClient, VoiceProtocol):
 
         if event == LavalinkEvents.TRACK_END:
             if extra == TrackEndReason.FINISHED:
+                if self.repeat_track and self.current is not None:
+                    self.queue.insert(0, self.current)
                 await self.play()
         elif event == LavalinkEvents.WEBSOCKET_CLOSED:
             code = extra.get("code")
@@ -367,7 +370,7 @@ class Player(RESTClient, VoiceProtocol):
         """
         Starts playback from lavalink.
         """
-        if self.repeat and self.current is not None:
+        if self.repeat and not self.repeat_track and self.current is not None:
             self.queue.append(self.current)
 
         self.current = None
